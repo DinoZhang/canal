@@ -28,15 +28,26 @@ public class CanalAdapterRocketMQWorker extends AbstractCanalAdapterWorker {
         this.canalClientConfig = canalClientConfig;
         this.topic = topic;
         this.flatMessage = flatMessage;
-        this.canalDestination = topic;
-        this.connector = new RocketMQCanalConnector(nameServers, topic, groupId, accessKey, secretKey, flatMessage);
+        super.canalDestination = topic;
+        super.groupId = groupId;
+        this.connector = new RocketMQCanalConnector(nameServers,
+            topic,
+            groupId,
+            accessKey,
+            secretKey,
+            canalClientConfig.getBatchSize(),
+            flatMessage);
         logger.info("RocketMQ consumer config topic:{}, nameServer:{}, groupId:{}", topic, nameServers, groupId);
     }
 
     @Override
     protected void process() {
-        while (!running)
-            ;
+        while (!running) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+            }
+        }
 
         ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
         int retry = canalClientConfig.getRetries() == null || canalClientConfig.getRetries() == 0 ? 1 : canalClientConfig.getRetries();
@@ -56,7 +67,17 @@ public class CanalAdapterRocketMQWorker extends AbstractCanalAdapterWorker {
                         connector.disconnect();
                         break;
                     }
-                    mqWriteOutData(retry, timeout, flatMessage, connector, workerExecutor);
+                    if (retry == -1) {
+                        retry = Integer.MAX_VALUE;
+                    }
+                    for (int i = 0; i < retry; i++) {
+                        if (!running) {
+                            break;
+                        }
+                        if (mqWriteOutData(retry, timeout, i, flatMessage, connector, workerExecutor)) {
+                            break;
+                        }
+                    }
                 }
             } catch (Exception e) {
                 logger.error(e.getMessage(), e);

@@ -13,12 +13,12 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import javax.sql.DataSource;
 
-import com.alibaba.otter.canal.client.adapter.rdb.support.SyncUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.alibaba.otter.canal.client.adapter.rdb.config.MappingConfig;
 import com.alibaba.otter.canal.client.adapter.rdb.config.MappingConfig.DbMapping;
+import com.alibaba.otter.canal.client.adapter.rdb.support.SyncUtil;
 import com.alibaba.otter.canal.client.adapter.support.EtlResult;
 import com.alibaba.otter.canal.client.adapter.support.Util;
 import com.google.common.base.Joiner;
@@ -109,7 +109,8 @@ public class RdbEtlService {
             logger.info(
                 dbMapping.getTable() + " etl completed in: " + (System.currentTimeMillis() - start) / 1000 + "s!");
 
-            etlResult.setResultMessage("导入目标表 " + dbMapping.getTargetTable() + " 数据：" + successCount.get() + " 条");
+            etlResult
+                .setResultMessage("导入目标表 " + SyncUtil.getDbTableName(dbMapping) + " 数据：" + successCount.get() + " 条");
         } catch (Exception e) {
             logger.error(e.getMessage(), e);
             errMsg.add(hbaseTable + " etl failed! ==>" + e.getMessage());
@@ -164,13 +165,12 @@ public class RdbEtlService {
     private static boolean executeSqlImport(DataSource srcDS, DataSource targetDS, String sql, DbMapping dbMapping,
                                             AtomicLong successCount, List<String> errMsg) {
         try {
-            Util.sqlRS(srcDS, sql, rs -> {
-                int idx = 1;
+            Map<String, String> columnsMap = new LinkedHashMap<>();
+            Map<String, Integer> columnType = new LinkedHashMap<>();
 
+            Util.sqlRS(targetDS, "SELECT * FROM " + SyncUtil.getDbTableName(dbMapping) + " LIMIT 1 ", rs -> {
                 try {
-                    boolean completed = false;
 
-                    Map<String, Integer> columnType = new LinkedHashMap<>();
                     ResultSetMetaData rsd = rs.getMetaData();
                     int columnCount = rsd.getColumnCount();
                     List<String> columns = new ArrayList<>();
@@ -179,7 +179,20 @@ public class RdbEtlService {
                         columns.add(rsd.getColumnName(i));
                     }
 
-                    Map<String, String> columnsMap = SyncUtil.getColumnsMap(dbMapping, columns);
+                    columnsMap.putAll(SyncUtil.getColumnsMap(dbMapping, columns));
+                    return true;
+                } catch (Exception e) {
+                    logger.error(e.getMessage(), e);
+                    return false;
+                }
+            });
+
+            Util.sqlRS(srcDS, sql, rs -> {
+                int idx = 1;
+
+                try {
+                    boolean completed = false;
+
                     // if (dbMapping.isMapAll()) {
                     // columnsMap = dbMapping.getAllColumns();
                     // } else {
@@ -187,7 +200,7 @@ public class RdbEtlService {
                     // }
 
                     StringBuilder insertSql = new StringBuilder();
-                    insertSql.append("INSERT INTO ").append(dbMapping.getTargetTable()).append(" (");
+                    insertSql.append("INSERT INTO ").append(SyncUtil.getDbTableName(dbMapping)).append(" (");
                     columnsMap
                         .forEach((targetColumnName, srcColumnName) -> insertSql.append(targetColumnName).append(","));
 
@@ -204,12 +217,14 @@ public class RdbEtlService {
                         connTarget.setAutoCommit(false);
 
                         while (rs.next()) {
+                            completed = false;
+
                             pstmt.clearParameters();
 
                             // 删除数据
                             Map<String, Object> values = new LinkedHashMap<>();
                             StringBuilder deleteSql = new StringBuilder(
-                                "DELETE FROM " + dbMapping.getTargetTable() + " WHERE ");
+                                "DELETE FROM " + SyncUtil.getDbTableName(dbMapping) + " WHERE ");
                             appendCondition(dbMapping, deleteSql, values, rs);
                             try (PreparedStatement pstmt2 = connTarget.prepareStatement(deleteSql.toString())) {
                                 int k = 1;

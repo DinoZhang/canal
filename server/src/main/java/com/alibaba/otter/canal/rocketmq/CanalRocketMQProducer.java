@@ -1,14 +1,9 @@
 package com.alibaba.otter.canal.rocketmq;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.serializer.SerializerFeature;
-import com.alibaba.otter.canal.common.CanalMessageSerializer;
-import com.alibaba.otter.canal.common.MQProperties;
-import com.alibaba.otter.canal.protocol.FlatMessage;
-import com.alibaba.otter.canal.server.exception.CanalServerException;
-import com.alibaba.otter.canal.spi.CanalMQProducer;
-import com.aliyun.openservices.apache.api.impl.authority.SessionCredentials;
-import com.aliyun.openservices.apache.api.impl.rocketmq.ClientRPCHook;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.commons.lang.StringUtils;
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.client.producer.DefaultMQProducer;
@@ -20,7 +15,16 @@ import org.apache.rocketmq.remoting.exception.RemotingException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.serializer.SerializerFeature;
+import com.alibaba.otter.canal.common.CanalMessageSerializer;
+import com.alibaba.otter.canal.common.MQMessageUtils;
+import com.alibaba.otter.canal.common.MQProperties;
+import com.alibaba.otter.canal.protocol.FlatMessage;
+import com.alibaba.otter.canal.server.exception.CanalServerException;
+import com.alibaba.otter.canal.spi.CanalMQProducer;
+import com.aliyun.openservices.apache.api.impl.authority.SessionCredentials;
+import com.aliyun.openservices.apache.api.impl.rocketmq.ClientRPCHook;
 
 public class CanalRocketMQProducer implements CanalMQProducer {
 
@@ -34,8 +38,8 @@ public class CanalRocketMQProducer implements CanalMQProducer {
     public void init(MQProperties rocketMQProperties) {
         this.mqProperties = rocketMQProperties;
         RPCHook rpcHook = null;
-        if(rocketMQProperties.getAliyunAccessKey().length() > 0
-            && rocketMQProperties.getAliyunSecretKey().length() > 0){
+        if (rocketMQProperties.getAliyunAccessKey().length() > 0
+            && rocketMQProperties.getAliyunSecretKey().length() > 0) {
             SessionCredentials sessionCredentials = new SessionCredentials();
             sessionCredentials.setAccessKey(rocketMQProperties.getAliyunAccessKey());
             sessionCredentials.setSecretKey(rocketMQProperties.getAliyunSecretKey());
@@ -57,41 +61,105 @@ public class CanalRocketMQProducer implements CanalMQProducer {
     @Override
     public void send(final MQProperties.CanalDestination destination, com.alibaba.otter.canal.protocol.Message data,
                      Callback callback) {
+        try {
+            if (!StringUtils.isEmpty(destination.getDynamicTopic())) {
+                // 动态topic
+                Map<String, com.alibaba.otter.canal.protocol.Message> messageMap = MQMessageUtils
+                    .messageTopics(data, destination.getTopic(), destination.getDynamicTopic());
+
+                for (Map.Entry<String, com.alibaba.otter.canal.protocol.Message> entry : messageMap.entrySet()) {
+                    String topicName = entry.getKey().replace('.', '_');
+                    com.alibaba.otter.canal.protocol.Message messageSub = entry.getValue();
+                    send(destination, topicName, messageSub);
+                }
+            } else {
+                send(destination, destination.getTopic(), data);
+            }
+            callback.commit();
+        } catch (Exception e) {
+            callback.rollback();
+        }
+    }
+
+    public void send(final MQProperties.CanalDestination destination, String topicName,
+                     com.alibaba.otter.canal.protocol.Message data) throws Exception {
         if (!mqProperties.getFlatMessage()) {
             try {
-                Message message = new Message(destination.getTopic(), CanalMessageSerializer.serializer(data,
-                    mqProperties.isFilterTransactionEntry()));
-                logger.debug("send message:{} to destination:{}, partition: {}",
-                    message,
-                    destination.getCanalDestination(),
-                    destination.getPartition());
-                this.defaultMQProducer.send(message, new MessageQueueSelector() {
-
-                    @Override
-                    public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
-                        int partition = 0;
-                        if (destination.getPartition() != null) {
-                            partition = destination.getPartition();
-                        }
-                        return mqs.get(partition);
+                if (destination.getPartition() != null) {
+                    Message message = new Message(topicName,
+                        CanalMessageSerializer.serializer(data, mqProperties.isFilterTransactionEntry()));
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("send message:{} to destination:{}, partition: {}",
+                            message,
+                            destination.getCanalDestination(),
+                            destination.getPartition());
                     }
-                }, null);
+                    this.defaultMQProducer.send(message, new MessageQueueSelector() {
+
+                        @Override
+                        public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+                            int partition = 0;
+                            if (destination.getPartition() != null) {
+                                partition = destination.getPartition();
+                            }
+                            return mqs.get(partition);
+                        }
+                    }, null);
+                } else {
+                    if (destination.getPartitionHash() != null && !destination.getPartitionHash().isEmpty()) {
+                        com.alibaba.otter.canal.protocol.Message[] messages = MQMessageUtils
+                            .messagePartition(data, destination.getPartitionsNum(), destination.getPartitionHash());
+                        int length = messages.length;
+                        for (int i = 0; i < length; i++) {
+                            com.alibaba.otter.canal.protocol.Message dataPartition = messages[i];
+                            if (dataPartition != null) {
+                                if (logger.isDebugEnabled()) {
+                                    logger.debug("flatMessagePart: {}, partition: {}",
+                                        JSON.toJSONString(dataPartition, SerializerFeature.WriteMapNullValue),
+                                        i);
+                                }
+                                final int index = i;
+                                try {
+                                    Message message = new Message(topicName,
+                                        CanalMessageSerializer.serializer(dataPartition,
+                                            mqProperties.isFilterTransactionEntry()));
+                                    this.defaultMQProducer.send(message, new MessageQueueSelector() {
+
+                                        @Override
+                                        public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+                                            if (index > mqs.size()) {
+                                                throw new CanalServerException("partition number is error,config num:"
+                                                                               + destination.getPartitionsNum()
+                                                                               + ", mq num: " + mqs.size());
+                                            }
+                                            return mqs.get(index);
+                                        }
+                                    }, null);
+                                } catch (Exception e) {
+                                    logger.error("send flat message to hashed partition error", e);
+                                    throw e;
+                                }
+                            }
+                        }
+                    }
+                }
             } catch (MQClientException | RemotingException | MQBrokerException | InterruptedException e) {
                 logger.error("Send message error!", e);
-                callback.rollback();
-                return;
+                throw e;
             }
         } else {
-            List<FlatMessage> flatMessages = FlatMessage.messageConverter(data);
+            List<FlatMessage> flatMessages = MQMessageUtils.messageConverter(data);
             if (flatMessages != null) {
                 for (FlatMessage flatMessage : flatMessages) {
                     if (destination.getPartition() != null) {
                         try {
-                            logger.info("send flat message: {} to topic: {} fixed partition: {}",
-                                JSON.toJSONString(flatMessage, SerializerFeature.WriteMapNullValue),
-                                destination.getTopic(),
-                                destination.getPartition());
-                            Message message = new Message(destination.getTopic(),
+                            if (logger.isDebugEnabled()) {
+                                logger.debug("send message: {} to topic: {} fixed partition: {}",
+                                    JSON.toJSONString(flatMessage, SerializerFeature.WriteMapNullValue),
+                                    topicName,
+                                    destination.getPartition());
+                            }
+                            Message message = new Message(topicName,
                                 JSON.toJSONString(flatMessage, SerializerFeature.WriteMapNullValue).getBytes());
                             this.defaultMQProducer.send(message, new MessageQueueSelector() {
 
@@ -102,25 +170,27 @@ public class CanalRocketMQProducer implements CanalMQProducer {
                             }, null);
                         } catch (Exception e) {
                             logger.error("send flat message to fixed partition error", e);
-                            callback.rollback();
-                            return;
+                            throw e;
                         }
                     } else {
                         if (destination.getPartitionHash() != null && !destination.getPartitionHash().isEmpty()) {
-                            FlatMessage[] partitionFlatMessage = FlatMessage.messagePartition(flatMessage,
+                            FlatMessage[] partitionFlatMessage = MQMessageUtils.messagePartition(flatMessage,
                                 destination.getPartitionsNum(),
                                 destination.getPartitionHash());
                             int length = partitionFlatMessage.length;
                             for (int i = 0; i < length; i++) {
                                 FlatMessage flatMessagePart = partitionFlatMessage[i];
                                 if (flatMessagePart != null) {
-                                    logger.debug("flatMessagePart: {}, partition: {}",
-                                        JSON.toJSONString(flatMessagePart, SerializerFeature.WriteMapNullValue),
-                                        i);
+                                    if (logger.isDebugEnabled()) {
+                                        logger.debug("flatMessagePart: {}, partition: {}",
+                                            JSON.toJSONString(flatMessagePart, SerializerFeature.WriteMapNullValue),
+                                            i);
+                                    }
                                     final int index = i;
                                     try {
-                                        Message message = new Message(destination.getTopic(),
-                                            JSON.toJSONString(flatMessagePart, SerializerFeature.WriteMapNullValue).getBytes());
+                                        Message message = new Message(topicName,
+                                            JSON.toJSONString(flatMessagePart, SerializerFeature.WriteMapNullValue)
+                                                .getBytes());
                                         this.defaultMQProducer.send(message, new MessageQueueSelector() {
 
                                             @Override
@@ -137,8 +207,7 @@ public class CanalRocketMQProducer implements CanalMQProducer {
                                         }, null);
                                     } catch (Exception e) {
                                         logger.error("send flat message to hashed partition error", e);
-                                        callback.rollback();
-                                        return;
+                                        throw e;
                                     }
                                 }
                             }
@@ -148,7 +217,6 @@ public class CanalRocketMQProducer implements CanalMQProducer {
             }
         }
 
-        callback.commit();
         if (logger.isDebugEnabled()) {
             logger.debug("send message to rocket topic: {}", destination.getTopic());
         }
